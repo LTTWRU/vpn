@@ -9,8 +9,8 @@ services:
       - ./3xui/db:/etc/x-ui
       - ./3xui/cert:/root/cert
     ports:
-      - "443:443"
-      - "127.0.0.1:2053:2053"
+      - "127.0.0.1:10443:443"   # VLESS Reality (nginx routes here via SNI)
+      - "127.0.0.1:2053:2053"   # Panel (nginx routes here at panel.*)
     restart: unless-stopped
     networks:
       - vpn-net
@@ -22,22 +22,9 @@ services:
       - ./subscription/data:/app/data
     env_file: .env
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8001:8000"   # Subscription API (nginx routes here at sub.*)
     depends_on:
       - 3xui
-    restart: unless-stopped
-    networks:
-      - vpn-net
-
-  nginx:
-    image: nginx:alpine
-    container_name: nginx
-    ports:
-      - "80:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      - subscription
     restart: unless-stopped
     networks:
       - vpn-net
