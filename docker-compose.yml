@@ -20,6 +20,7 @@ services:
     container_name: subscription
     volumes:
       - ./subscription/data:/app/data
+      - ./3xui/db:/app/xui_db:ro   # read 3x-ui database directly
     env_file: .env
     ports:
       - "127.0.0.1:8001:8000"   # Subscription API (nginx routes here at sub.*)

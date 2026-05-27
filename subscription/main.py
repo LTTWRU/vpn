@@ -5,26 +5,21 @@ import secrets
 import sqlite3
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import Response
-import httpx
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-XUI_URL = os.getenv("XUI_URL", "http://3xui:2053")
-XUI_USERNAME = os.getenv("XUI_USERNAME", "admin")
-XUI_PASSWORD = os.getenv("XUI_PASSWORD", "admin")
 SERVER_DOMAIN = os.getenv("SERVER_DOMAIN", "")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-INBOUND_ID = int(os.getenv("INBOUND_ID", "1"))
-DB_PATH = "/app/data/subscriptions.db"
+ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN", "")
+SUB_DB_PATH   = "/app/data/subscriptions.db"
+XUI_DB_PATH   = "/app/xui_db/x-ui.db"
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(SUB_DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
             token        TEXT PRIMARY KEY,
@@ -52,102 +47,73 @@ app = FastAPI(
 )
 
 
-# ── 3x-ui helpers ─────────────────────────────────────────────────────────────
+# ── 3x-ui SQLite reader ────────────────────────────────────────────────────────
 
-async def xui_login() -> dict:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{XUI_URL}/login",
-            data={"username": XUI_USERNAME, "password": XUI_PASSWORD},
-            timeout=10,
-        )
-    if resp.status_code != 200 or not resp.json().get("success"):
-        logger.error("3x-ui login failed: %s", resp.text)
-        raise HTTPException(503, "3x-ui authentication failed")
-    return dict(resp.cookies)
-
-
-async def fetch_inbounds(cookies: dict) -> list:
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{XUI_URL}/xui/API/inbounds",
-            cookies=cookies,
-            timeout=10,
-        )
-    if resp.status_code != 200:
-        raise HTTPException(503, "Failed to fetch inbounds")
-    data = resp.json()
-    if not data.get("success"):
-        raise HTTPException(503, "3x-ui API error")
-    return data.get("obj", [])
-
-
-def build_vless_link(
-    inbound: dict, client_email: str, server_addr: str
-) -> Optional[str]:
+def get_user_links(client_email: str) -> list[str]:
+    """Build VLESS links by reading directly from 3x-ui SQLite."""
     try:
-        settings = json.loads(inbound.get("settings", "{}"))
-        stream = json.loads(inbound.get("streamSettings", "{}"))
-    except (json.JSONDecodeError, TypeError):
-        return None
+        conn = sqlite3.connect(XUI_DB_PATH)
+        rows = conn.execute(
+            "SELECT settings, stream_settings, port FROM inbounds"
+            " WHERE enable=1 AND protocol='vless'"
+        ).fetchall()
+        conn.close()
+    except Exception as e:
+        logger.error("Failed to read x-ui.db: %s", e)
+        return []
 
-    client_cfg = next(
-        (c for c in settings.get("clients", []) if c.get("email") == client_email),
-        None,
-    )
-    if not client_cfg:
-        return None
-
-    uuid = client_cfg.get("id", "")
-    port = inbound.get("port", 443)
-    security = stream.get("security", "")
-
-    if security != "reality":
-        return None
-
-    reality = stream.get("realitySettings", {})
-    public_key = reality.get("publicKey", "")
-    short_ids = reality.get("shortIds", [""])
-    short_id = short_ids[0] if short_ids else ""
-    server_names = reality.get("serverNames", ["apple.com"])
-    sni = server_names[0] if server_names else "apple.com"
-    flow = client_cfg.get("flow", "xtls-rprx-vision")
-    remark = client_email.replace(" ", "+")
-
-    return (
-        f"vless://{uuid}@{server_addr}:{port}"
-        f"?encryption=none&flow={flow}&security=reality"
-        f"&sni={sni}&fp=chrome&pbk={public_key}"
-        f"&sid={short_id}&type=tcp&headerType=none#{remark}"
-    )
-
-
-async def get_user_links(client_email: str) -> list[str]:
-    cookies = await xui_login()
-    inbounds = await fetch_inbounds(cookies)
     links = []
-    for inbound in inbounds:
-        if inbound.get("protocol") != "vless":
+    for settings_str, stream_str, port in rows:
+        try:
+            settings = json.loads(settings_str)
+            stream   = json.loads(stream_str)
+        except (json.JSONDecodeError, TypeError):
             continue
-        link = build_vless_link(inbound, client_email, SERVER_DOMAIN)
-        if link:
-            links.append(link)
+
+        client_cfg = next(
+            (c for c in settings.get("clients", []) if c.get("email") == client_email),
+            None,
+        )
+        if not client_cfg:
+            continue
+
+        if stream.get("security") != "reality":
+            continue
+
+        reality    = stream.get("realitySettings", {})
+        public_key = reality.get("publicKey", "")
+        short_ids  = reality.get("shortIds", [""])
+        short_id   = short_ids[0] if short_ids else ""
+        server_names = reality.get("serverNames", ["apple.com"])
+        sni        = server_names[0] if server_names else "apple.com"
+        uuid       = client_cfg.get("id", "")
+        flow       = client_cfg.get("flow", "xtls-rprx-vision")
+        remark     = client_email.replace(" ", "+")
+
+        link = (
+            f"vless://{uuid}@{SERVER_DOMAIN}:{port}"
+            f"?encryption=none&flow={flow}&security=reality"
+            f"&sni={sni}&fp=chrome&pbk={public_key}"
+            f"&sid={short_id}&type=tcp&headerType=none#{remark}"
+        )
+        links.append(link)
+
     return links
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Auth ────────────────────────────────────────────────────────────────────────
 
 def require_admin(x_admin_token: str = Header(None)):
     if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
         raise HTTPException(403, "Forbidden")
 
 
-# ── Public endpoints ──────────────────────────────────────────────────────────
+# ── Public endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/sub/{token}")
 async def get_subscription(token: str):
     """Return base64-encoded VLESS subscription for the given token."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(SUB_DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT client_email FROM subscriptions WHERE token = ? AND active = 1",
@@ -159,7 +125,7 @@ async def get_subscription(token: str):
     if not row:
         raise HTTPException(404, "Not found")
 
-    links = await get_user_links(row[0])
+    links = get_user_links(row[0])
     if not links:
         raise HTTPException(404, "No active configurations")
 
@@ -176,7 +142,7 @@ async def health():
     return {"status": "ok"}
 
 
-# ── Admin endpoints (internal, not exposed via nginx) ─────────────────────────
+# ── Admin endpoints ───────────────────────────────────────────────────────────────
 
 @app.post("/admin/users", dependencies=[Depends(require_admin)])
 async def create_subscription(body: dict):
@@ -186,7 +152,7 @@ async def create_subscription(body: dict):
         raise HTTPException(400, "email is required")
 
     token = secrets.token_urlsafe(24)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(SUB_DB_PATH)
     try:
         conn.execute(
             "INSERT INTO subscriptions (token, client_email) VALUES (?, ?)",
@@ -201,19 +167,19 @@ async def create_subscription(body: dict):
         row = cursor.fetchone()
         conn.close()
         return {"token": row[0], "email": email, "already_exists": True,
-                "sub_url": f"http://{SERVER_DOMAIN}/sub/{row[0]}"}
+                "sub_url": f"https://{SERVER_DOMAIN}/sub/{row[0]}"}
     conn.close()
     return {
         "token": token,
         "email": email,
-        "sub_url": f"http://{SERVER_DOMAIN}/sub/{token}",
+        "sub_url": f"https://{SERVER_DOMAIN}/sub/{token}",
     }
 
 
 @app.delete("/admin/users/{email}", dependencies=[Depends(require_admin)])
 async def deactivate_user(email: str):
-    """Deactivate a subscription (user loses access immediately)."""
-    conn = sqlite3.connect(DB_PATH)
+    """Deactivate a subscription."""
+    conn = sqlite3.connect(SUB_DB_PATH)
     conn.execute(
         "UPDATE subscriptions SET active = 0 WHERE client_email = ?", (email,)
     )
@@ -225,7 +191,7 @@ async def deactivate_user(email: str):
 @app.get("/admin/users", dependencies=[Depends(require_admin)])
 async def list_users():
     """List all registered subscriptions."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(SUB_DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT token, client_email, created_at, active FROM subscriptions"
@@ -239,7 +205,7 @@ async def list_users():
             "email": r[1],
             "created_at": r[2],
             "active": bool(r[3]),
-            "sub_url": f"http://{SERVER_DOMAIN}/sub/{r[0]}",
+            "sub_url": f"https://{SERVER_DOMAIN}/sub/{r[0]}",
         }
         for r in rows
     ]
