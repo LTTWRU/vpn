@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Creates VLESS+Reality inbound in 3x-ui via local API
+# Creates VLESS+Reality inbound in 3x-ui via local API (3x-ui v3, with CSRF)
 set -uo pipefail
 
 cd /opt/vpn
@@ -14,99 +14,131 @@ echo ""
 echo "=== Creating VLESS Reality inbound ==="
 echo ""
 
-# Try login with configured password, fallback to admin/admin
+# Step 1: Get CSRF token and session cookie from login page
+echo "[+] Fetching CSRF token..."
+HTML=$(curl -s --max-time 10 -c "$COOKIE" "${XUI}/")
+CSRF=$(echo "$HTML" | grep -oP '(?<=csrf-token" content=")[^"]+' || true)
+
+if [[ -z "$CSRF" ]]; then
+    # Try alternative meta tag format
+    CSRF=$(echo "$HTML" | python3 -c "
+import sys, re
+m = re.search(r'csrf-token.*?content=\"([^\"]+)', sys.stdin.read())
+print(m.group(1) if m else '')
+" 2>/dev/null || true)
+fi
+
+echo "[+] CSRF token: ${CSRF:0:20}..."
+
+# Step 2: Try login with both passwords
 login_ok=0
-for PASS in "${XUI_PASSWORD}" "admin"; do
-    RESP=$(curl -s --max-time 10 -c "$COOKIE" -X POST "$XUI/login" \
-        -d "username=${XUI_USERNAME:-admin}&password=${PASS}" 2>&1)
-    if echo "$RESP" | grep -q '"success":true'; then
-        echo "[+] Logged in (password: ${PASS})"
+for PASS in "${XUI_PASSWORD:-}" "admin"; do
+    [[ -z "$PASS" ]] && continue
+    
+    # Try JSON body first (3x-ui v3)
+    RESP=$(curl -s --max-time 10 \
+        -c "$COOKIE" -b "$COOKIE" \
+        -X POST "${XUI}/login" \
+        -H "X-CSRF-Token: ${CSRF}" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"${XUI_USERNAME:-admin}\",\"password\":\"${PASS}\"}" 2>&1)
+    
+    if echo "$RESP" | grep -qi 'success.*true\|token\|"id"'; then
+        echo "[+] Logged in with JSON body (pass: ${PASS})"
         login_ok=1
         break
     fi
+    
+    # Try form data (3x-ui v2)
+    RESP=$(curl -s --max-time 10 \
+        -c "$COOKIE" -b "$COOKIE" \
+        -X POST "${XUI}/login" \
+        -H "X-CSRF-Token: ${CSRF}" \
+        -d "username=${XUI_USERNAME:-admin}&password=${PASS}" 2>&1)
+    
+    if echo "$RESP" | grep -qi '"success":true'; then
+        echo "[+] Logged in with form data (pass: ${PASS})"
+        login_ok=1
+        break
+    fi
+    
+    echo "    Tried pass '${PASS}': $(echo $RESP | head -c 100)"
 done
 
 if [[ $login_ok -eq 0 ]]; then
-    echo "ERROR: Login failed. Response: $RESP"
-    echo "Check credentials in /opt/vpn/.env"
-    exit 1
-fi
+    echo ""
+    echo "ERROR: Cannot log into 3x-ui API."
+    echo "Falling back to direct DB method..."
+    
+    # Generate keys and inbound via direct DB write
+    KEYS=$(docker exec 3xui xray x25519 2>/dev/null)
+    PRIV=$(echo "$KEYS" | awk '/Private/{print $NF}')
+    PUB=$(echo  "$KEYS" | awk '/Public/{print $NF}')
+    SHORTID=$(openssl rand -hex 4)
+    
+    echo "[+] X25519 keys generated"
+    echo "    Private key : $PRIV"
+    echo "    Public key  : $PUB"
+    echo "    Short ID    : $SHORTID"
+    
+    python3 << PYEOF
+import sqlite3, json, sys
 
-# Generate X25519 keys + payload via Python
-echo "[+] Generating X25519 keys..."
-python3 << 'PYEOF' > "$JSON"
-import json, subprocess, secrets, sys
-
-r = subprocess.run(['docker', 'exec', '3xui', 'xray', 'x25519'],
-                   capture_output=True, text=True)
-priv = pub = ''
-for line in r.stdout.strip().splitlines():
-    if 'Private' in line: priv = line.split()[-1]
-    if 'Public'  in line: pub  = line.split()[-1]
-
-if not priv:
-    print('ERROR: xray x25519 failed:', r.stderr, file=sys.stderr)
-    sys.exit(1)
-
-shortid = secrets.token_hex(4)
-
-print(f'    Private key : {priv}', file=sys.stderr)
-print(f'    Public key  : {pub}',  file=sys.stderr)
-print(f'    Short ID    : {shortid}', file=sys.stderr)
-
-with open('/tmp/reality_keys.env', 'w') as f:
-    f.write(f'REALITY_PUBLIC_KEY={pub}\nREALITY_SHORT_ID={shortid}\n')
+priv = '$PRIV'
+pub  = '$PUB'
+shortid = '$SHORTID'
 
 stream = {
-    'network': 'tcp',
-    'security': 'reality',
+    'network': 'tcp', 'security': 'reality',
     'realitySettings': {
         'show': False, 'xver': 0,
         'dest': 'www.apple.com:443',
         'serverNames': ['www.apple.com'],
-        'privateKey': priv,
-        'minClient': '', 'maxTimeDiff': 0,
-        'shortIds': [shortid],
-        'fingerprint': 'chrome',
-        'headers': {}
+        'privateKey': priv, 'minClient': '',
+        'maxTimeDiff': 0, 'shortIds': [shortid],
+        'fingerprint': 'chrome', 'headers': {}
     },
     'tcpSettings': {'acceptProxyProtocol': False, 'header': {'type': 'none'}}
 }
 
-payload = {
-    'remark': 'VLESS-Reality',
-    'enable': True,
-    'listen': '',
-    'port': 443,
-    'protocol': 'vless',
-    'expiryTime': 0,
-    'settings':       json.dumps({'clients': [], 'decryption': 'none', 'fallbacks': []}),
-    'streamSettings': json.dumps(stream),
-    'sniffing':       json.dumps({'enabled': True,
-                                  'destOverride': ['http','tls','quic','fakedns'],
-                                  'metadataOnly': False, 'routeOnly': False}),
-    'tag': 'inbound-443'
+row = {
+    'user_id': 1, 'up': 0, 'down': 0, 'total': 0,
+    'remark': 'VLESS-Reality', 'enable': 1,
+    'expiry_time': 0, 'listen': '', 'port': 443,
+    'protocol': 'vless', 'settings': json.dumps({'clients':[],'decryption':'none','fallbacks':[]}),
+    'stream_settings': json.dumps(stream),
+    'tag': 'inbound-443',
+    'sniffing': json.dumps({'enabled':True,'destOverride':['http','tls','quic','fakedns'],'metadataOnly':False,'routeOnly':False}),
+    'allocate': json.dumps({'strategy':'always','refresh':5,'concurrency':3})
 }
-print(json.dumps(payload))
+
+db = sqlite3.connect('/opt/vpn/3xui/db/x-ui.db')
+try:
+    db.execute('''
+        INSERT INTO inbounds
+        (user_id,up,down,total,remark,enable,expiry_time,listen,port,protocol,
+         settings,stream_settings,tag,sniffing,allocate)
+        VALUES
+        (:user_id,:up,:down,:total,:remark,:enable,:expiry_time,:listen,:port,:protocol,
+         :settings,:stream_settings,:tag,:sniffing,:allocate)
+    ''', row)
+    db.commit()
+    print('[+] Inbound written directly to database')
+except Exception as e:
+    print(f'DB error: {e}', file=sys.stderr)
+finally:
+    db.close()
+
+with open('/tmp/reality_keys.env','w') as f:
+    f.write(f'REALITY_PUBLIC_KEY={pub}\nREALITY_SHORT_ID={shortid}\n')
 PYEOF
-
-echo "[+] Sending to 3x-ui API..."
-ADD=$(curl -s --max-time 10 -b "$COOKIE" -X POST "$XUI/xui/API/inbounds/add" \
-    -H 'Content-Type: application/json' \
-    -d @"$JSON")
-
-echo "Response: $ADD"
-
-if echo "$ADD" | grep -q '"success":true'; then
-    INBOUND_ID=$(python3 -c "import sys,json; print(json.load(sys.stdin)['obj']['id'])" <<< "$ADD" 2>/dev/null || echo "1")
-    sed -i "s/^INBOUND_ID=.*/INBOUND_ID=${INBOUND_ID}/" .env
-    grep -q REALITY_PUBLIC_KEY .env 2>/dev/null || cat /tmp/reality_keys.env >> .env
-    echo "[+] Inbound created (id=${INBOUND_ID})"
-else
-    echo "WARN: Could not create inbound automatically."
-    echo "      Create it manually in the panel (see keys above)."
+    
+    # Restart to pick up new inbound
+    docker restart 3xui > /dev/null 2>&1
+    echo "[+] 3x-ui restarted to load new inbound"
 fi
 
+# Show summary
 source /tmp/reality_keys.env 2>/dev/null || true
 echo ""
 echo "================================================"
