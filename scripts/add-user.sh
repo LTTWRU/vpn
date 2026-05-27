@@ -10,43 +10,70 @@ EMAIL="${1:-}"
 
 XUI_HOST="http://127.0.0.1:2053"
 SUB_HOST="http://127.0.0.1:8001"
-
 UUID=$(cat /proc/sys/kernel/random/uuid)
 COOKIE=$(mktemp)
-cleanup() { rm -f "$COOKIE"; }
-trap cleanup EXIT
+trap "rm -f $COOKIE" EXIT
 
-# ── Login to 3x-ui ────────────────────────────────────────────────────
-LOGIN=$(curl -sf -c "$COOKIE" -X POST "$XUI_HOST/login" \
-    -d "username=${XUI_USERNAME}&password=${XUI_PASSWORD}")
-echo "$LOGIN" | grep -q '"success":true' || { echo "ERROR: 3x-ui login failed. Check .env credentials"; exit 1; }
+# ── Login to 3x-ui (v3 with CSRF) ───────────────────────────────────────
+HTML=$(curl -s --max-time 10 -c "$COOKIE" "${XUI_HOST}/")
+CSRF=$(grep -o 'csrf-token" content="[^"]*' <<< "$HTML" | sed 's/csrf-token" content="//')
 
-# ── Add client (limitIp=1 = 1 device only) ────────────────────────────
-CLIENT_PAYLOAD=$(printf \
-    '{"id":%d,"settings":"{\\"clients\\":[{\\"id\\":\\"%s\\",\\"email\\":\\"%s\\",\\"limitIp\\":1,\\"totalGB\\":0,\\"expiryTime\\":0,\\"enable\\":true,\\"tgId\\":\\"\\",\\"subId\\":\\"\\",\\"flow\\":\\"xtls-rprx-vision\\"}]}"}'  \
-    "$INBOUND_ID" "$UUID" "$EMAIL")
+login_ok=0
+for PASS in "${XUI_PASSWORD:-}" "admin"; do
+    [[ -z "$PASS" ]] && continue
+    R=$(curl -s --max-time 10 -c "$COOKIE" -b "$COOKIE" \
+        -X POST "${XUI_HOST}/login" \
+        -H "X-CSRF-Token: ${CSRF}" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"${XUI_USERNAME:-admin}\",\"password\":\"${PASS}\"}" 2>/dev/null)
+    echo "$R" | grep -q '"success":true' && { login_ok=1; break; }
+done
+[[ $login_ok -eq 0 ]] && { echo "ERROR: 3x-ui login failed"; exit 1; }
 
-ADD=$(curl -sf -b "$COOKIE" -X POST "$XUI_HOST/xui/API/inbounds/addClient" \
+# ── Add VLESS client ───────────────────────────────────────────────────────────
+CLIENT_JSON=$(python3 -c "
+import json
+client = {
+    'id': '${UUID}',
+    'email': '${EMAIL}',
+    'limitIp': 1,
+    'totalGB': 0,
+    'expiryTime': 0,
+    'enable': True,
+    'tgId': '',
+    'subId': '',
+    'flow': 'xtls-rprx-vision'
+}
+payload = {'id': ${INBOUND_ID}, 'settings': json.dumps({'clients': [client]})}
+print(json.dumps(payload))
+")
+
+ADD=$(curl -s --max-time 10 \
+    -b "$COOKIE" \
+    -X POST "${XUI_HOST}/xui/API/inbounds/addClient" \
     -H "Content-Type: application/json" \
-    -d "$CLIENT_PAYLOAD")
-echo "$ADD" | grep -q '"success":true' || echo "WARN: 3x-ui response: $ADD"
+    -H "X-CSRF-Token: ${CSRF}" \
+    -d "$CLIENT_JSON")
 
-# ── Register subscription token ────────────────────────────────────────
-SUB_RESP=$(curl -sf -X POST "$SUB_HOST/admin/users" \
+if ! echo "$ADD" | grep -q '"success":true'; then
+    echo "WARN: 3x-ui addClient response: $ADD"
+fi
+
+# ── Register subscription token ─────────────────────────────────────────
+SUB=$(curl -s --max-time 10 \
+    -X POST "${SUB_HOST}/admin/users" \
     -H "Content-Type: application/json" \
     -H "X-Admin-Token: ${ADMIN_TOKEN}" \
     -d "{\"email\":\"${EMAIL}\"}")
 
-TOKEN=$(python3 -c "import sys,json; print(json.loads(sys.stdin.read())['token'])" <<< "$SUB_RESP" 2>/dev/null || echo "")
-[[ -z "$TOKEN" ]] && { echo "ERROR: Could not create subscription token. Response: $SUB_RESP"; exit 1; }
+TOKEN=$(python3 -c "import sys,json; print(json.loads(sys.stdin.read())['token'])" <<< "$SUB" 2>/dev/null || true)
+[[ -z "$TOKEN" ]] && { echo "ERROR: subscription service response: $SUB"; exit 1; }
 
 echo ""
-echo "========================================"
-echo "  User added successfully"
-echo "  Email        : ${EMAIL}"
-echo "  UUID         : ${UUID}"
-echo "  Subscription : https://sub.pravoslavny-obereg.ru/sub/${TOKEN}"
-echo "========================================"
+echo "===================================="
+echo "  User added"
+echo "  Email : ${EMAIL}"
+echo "  UUID  : ${UUID}"
+echo "  Sub   : https://sub.pravoslavny-obereg.ru/sub/${TOKEN}"
+echo "===================================="
 echo ""
-echo "Send the Subscription URL to the user."
-echo "Supported clients: v2rayN, Sing-box, NekoBox, Hiddify"
