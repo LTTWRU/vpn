@@ -14,6 +14,20 @@ UUID=$(cat /proc/sys/kernel/random/uuid)
 COOKIE=$(mktemp)
 trap "rm -f $COOKIE" EXIT
 
+# ── Resolve inbound ID ────────────────────────────────────────────────
+if [[ -z "${INBOUND_ID:-}" ]]; then
+    INBOUND_ID=$(python3 -c "
+import sqlite3
+db = sqlite3.connect('/opt/vpn/3xui/db/x-ui.db')
+row = db.execute('SELECT id FROM inbounds WHERE port=443').fetchone()
+db.close()
+print(row[0] if row else '')
+")
+    [[ -z "$INBOUND_ID" ]] && { echo "ERROR: No inbound found on port 443. Run inbound.sh first."; exit 1; }
+    # Persist it for next time
+    echo "INBOUND_ID=${INBOUND_ID}" >> .env
+fi
+
 # ── Login to 3x-ui (v3 with CSRF) ───────────────────────────────────────
 HTML=$(curl -s --max-time 10 -c "$COOKIE" "${XUI_HOST}/")
 CSRF=$(grep -o 'csrf-token" content="[^"]*' <<< "$HTML" | sed 's/csrf-token" content="//')
@@ -30,7 +44,7 @@ for PASS in "${XUI_PASSWORD:-}" "admin"; do
 done
 [[ $login_ok -eq 0 ]] && { echo "ERROR: 3x-ui login failed"; exit 1; }
 
-# ── Add VLESS client ───────────────────────────────────────────────────────────
+# ── Add VLESS client ────────────────────────────────────────────────────
 CLIENT_JSON=$(python3 -c "
 import json
 client = {
@@ -59,7 +73,7 @@ if ! echo "$ADD" | grep -q '"success":true'; then
     echo "WARN: 3x-ui addClient response: $ADD"
 fi
 
-# ── Register subscription token ─────────────────────────────────────────
+# ── Register subscription token ──────────────────────────────────────
 SUB=$(curl -s --max-time 10 \
     -X POST "${SUB_HOST}/admin/users" \
     -H "Content-Type: application/json" \
