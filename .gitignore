@@ -1,0 +1,6 @@
+.env
+3xui/db/
+3xui/cert/
+subscription/data/
+*.db
+*.sqlite
