@@ -12,10 +12,11 @@ from fastapi.responses import Response
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-SERVER_DOMAIN = os.getenv("SERVER_DOMAIN", "")
-ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN", "")
-SUB_DB_PATH   = "/app/data/subscriptions.db"
-XUI_DB_PATH   = "/app/xui_db/x-ui.db"
+SERVER_DOMAIN      = os.getenv("SERVER_DOMAIN", "")
+ADMIN_TOKEN        = os.getenv("ADMIN_TOKEN", "")
+REALITY_PUBLIC_KEY = os.getenv("REALITY_PUBLIC_KEY", "")  # fallback when not in DB
+SUB_DB_PATH        = "/app/data/subscriptions.db"
+XUI_DB_PATH        = "/app/xui_db/x-ui.db"
 
 
 def init_db():
@@ -35,7 +36,8 @@ def init_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    logger.info("Subscription service started. SERVER_DOMAIN=%s", SERVER_DOMAIN)
+    logger.info("Subscription service started. SERVER_DOMAIN=%s REALITY_PUBLIC_KEY=%s",
+                SERVER_DOMAIN, REALITY_PUBLIC_KEY[:8] + "..." if REALITY_PUBLIC_KEY else "NOT SET")
     yield
 
 
@@ -80,15 +82,20 @@ def get_user_links(client_email: str) -> list[str]:
         if stream.get("security") != "reality":
             continue
 
-        reality    = stream.get("realitySettings", {})
-        public_key = reality.get("publicKey", "")
-        short_ids  = reality.get("shortIds", [""])
-        short_id   = short_ids[0] if short_ids else ""
-        server_names = reality.get("serverNames", ["apple.com"])
-        sni        = server_names[0] if server_names else "apple.com"
-        uuid       = client_cfg.get("id", "")
-        flow       = client_cfg.get("flow", "xtls-rprx-vision")
-        remark     = client_email.replace(" ", "+")
+        reality      = stream.get("realitySettings", {})
+        # publicKey may not be stored in older inbound records — fall back to env var
+        public_key   = reality.get("publicKey", "") or REALITY_PUBLIC_KEY
+        short_ids    = reality.get("shortIds", [""])
+        short_id     = short_ids[0] if short_ids else ""
+        server_names = reality.get("serverNames", ["www.apple.com"])
+        sni          = server_names[0] if server_names else "www.apple.com"
+        uuid         = client_cfg.get("id", "")
+        flow         = client_cfg.get("flow", "xtls-rprx-vision")
+        remark       = client_email.split("@")[0]
+
+        if not public_key:
+            logger.error("No public key for inbound on port %s", port)
+            continue
 
         link = (
             f"vless://{uuid}@{SERVER_DOMAIN}:{port}"
@@ -97,6 +104,7 @@ def get_user_links(client_email: str) -> list[str]:
             f"&sid={short_id}&type=tcp&headerType=none#{remark}"
         )
         links.append(link)
+        logger.info("Built link for %s (port=%s uuid=%s)", client_email, port, uuid[:8])
 
     return links
 
@@ -127,7 +135,8 @@ async def get_subscription(token: str):
 
     links = get_user_links(row[0])
     if not links:
-        raise HTTPException(404, "No active configurations")
+        logger.error("No links for token=%s email=%s", token, row[0])
+        raise HTTPException(404, "No active configurations found")
 
     content = base64.b64encode("\n".join(links).encode()).decode()
     return Response(
@@ -139,14 +148,21 @@ async def get_subscription(token: str):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    xui_ok = False
+    try:
+        conn = sqlite3.connect(XUI_DB_PATH)
+        conn.execute("SELECT 1 FROM inbounds LIMIT 1")
+        conn.close()
+        xui_ok = True
+    except Exception:
+        pass
+    return {"status": "ok", "xui_db": xui_ok, "public_key_set": bool(REALITY_PUBLIC_KEY)}
 
 
 # ── Admin endpoints ───────────────────────────────────────────────────────────────
 
 @app.post("/admin/users", dependencies=[Depends(require_admin)])
 async def create_subscription(body: dict):
-    """Register a subscription token for a 3x-ui client email."""
     email = body.get("email", "").strip()
     if not email:
         raise HTTPException(400, "email is required")
@@ -161,28 +177,20 @@ async def create_subscription(body: dict):
         conn.commit()
     except sqlite3.IntegrityError:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT token FROM subscriptions WHERE client_email = ?", (email,)
-        )
+        cursor.execute("SELECT token FROM subscriptions WHERE client_email = ?", (email,))
         row = cursor.fetchone()
         conn.close()
         return {"token": row[0], "email": email, "already_exists": True,
                 "sub_url": f"https://{SERVER_DOMAIN}/sub/{row[0]}"}
     conn.close()
-    return {
-        "token": token,
-        "email": email,
-        "sub_url": f"https://{SERVER_DOMAIN}/sub/{token}",
-    }
+    return {"token": token, "email": email,
+            "sub_url": f"https://{SERVER_DOMAIN}/sub/{token}"}
 
 
 @app.delete("/admin/users/{email}", dependencies=[Depends(require_admin)])
 async def deactivate_user(email: str):
-    """Deactivate a subscription."""
     conn = sqlite3.connect(SUB_DB_PATH)
-    conn.execute(
-        "UPDATE subscriptions SET active = 0 WHERE client_email = ?", (email,)
-    )
+    conn.execute("UPDATE subscriptions SET active = 0 WHERE client_email = ?", (email,))
     conn.commit()
     conn.close()
     return {"status": "deactivated", "email": email}
@@ -190,7 +198,6 @@ async def deactivate_user(email: str):
 
 @app.get("/admin/users", dependencies=[Depends(require_admin)])
 async def list_users():
-    """List all registered subscriptions."""
     conn = sqlite3.connect(SUB_DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
@@ -200,12 +207,7 @@ async def list_users():
     rows = cursor.fetchall()
     conn.close()
     return [
-        {
-            "token": r[0],
-            "email": r[1],
-            "created_at": r[2],
-            "active": bool(r[3]),
-            "sub_url": f"https://{SERVER_DOMAIN}/sub/{r[0]}",
-        }
+        {"token": r[0], "email": r[1], "created_at": r[2], "active": bool(r[3]),
+         "sub_url": f"https://{SERVER_DOMAIN}/sub/{r[0]}"}
         for r in rows
     ]

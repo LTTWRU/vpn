@@ -46,6 +46,7 @@ stream = {
         'dest': 'www.apple.com:443',
         'serverNames': ['www.apple.com'],
         'privateKey': priv,
+        'publicKey': pub,
         'minClient': '', 'maxTimeDiff': 0,
         'shortIds': [shortid],
         'fingerprint': 'chrome', 'headers': {}
@@ -88,7 +89,6 @@ try:
         iid = cur.lastrowid
         print(f'[+] Inbound inserted into SQLite (id={iid})')
     db.commit()
-    # Write ID to a temp file so bash can read it
     with open('/tmp/xui_inbound_id', 'w') as f:
         f.write(str(iid))
 except Exception as e:
@@ -116,16 +116,14 @@ echo "[+] Done (waiting 5s)"
 sleep 5
 
 # ── Save keys to .env ───────────────────────────────────────────────
-if grep -q '^REALITY_PUBLIC_KEY=' .env; then
-    sed -i "s/^REALITY_PUBLIC_KEY=.*/REALITY_PUBLIC_KEY=${PUB}/" .env
-else
-    echo "REALITY_PUBLIC_KEY=${PUB}" >> .env
-fi
-if grep -q '^REALITY_SHORT_ID=' .env; then
-    sed -i "s/^REALITY_SHORT_ID=.*/REALITY_SHORT_ID=${SHORTID}/" .env
-else
-    echo "REALITY_SHORT_ID=${SHORTID}" >> .env
-fi
+for kv in "REALITY_PUBLIC_KEY=${PUB}" "REALITY_SHORT_ID=${SHORTID}"; do
+    key="${kv%%=*}"
+    if grep -q "^${key}=" .env; then
+        sed -i "s|^${key}=.*|${kv}|" .env
+    else
+        echo "$kv" >> .env
+    fi
+done
 sed -i "s/^XUI_PASSWORD=.*/XUI_PASSWORD=admin/" .env
 
 echo ""

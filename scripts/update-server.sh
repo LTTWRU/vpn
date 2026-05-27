@@ -11,5 +11,9 @@ git pull origin claude/vpn-3xui-subscriptions-TdUoz
 echo "[+] Rebuilding subscription service..."
 docker compose up -d --build subscription
 
-echo "[+] Done"
+echo ""
+echo "[+] Checking health..."
+sleep 3
+curl -s http://127.0.0.1:8001/health | python3 -m json.tool || true
+echo ""
 docker compose ps
