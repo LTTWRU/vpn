@@ -8,79 +8,75 @@ source .env
 EMAIL="${1:-}"
 [[ -z "$EMAIL" ]] && { echo "Usage: bash scripts/add-user.sh <email>"; exit 1; }
 
-XUI_HOST="http://127.0.0.1:2053"
 SUB_HOST="http://127.0.0.1:8001"
 UUID=$(cat /proc/sys/kernel/random/uuid)
-COOKIE=$(mktemp)
-trap "rm -f $COOKIE" EXIT
+DB="/opt/vpn/3xui/db/x-ui.db"
 
 # ── Resolve inbound ID ────────────────────────────────────────────────
 if [[ -z "${INBOUND_ID:-}" ]]; then
     INBOUND_ID=$(python3 -c "
 import sqlite3
-db = sqlite3.connect('/opt/vpn/3xui/db/x-ui.db')
+db = sqlite3.connect('${DB}')
 row = db.execute('SELECT id FROM inbounds WHERE port=443').fetchone()
 db.close()
 print(row[0] if row else '')
 ")
     [[ -z "$INBOUND_ID" ]] && { echo "ERROR: No inbound found on port 443. Run inbound.sh first."; exit 1; }
-    # Persist it for next time
     echo "INBOUND_ID=${INBOUND_ID}" >> .env
 fi
 
-# ── Login to 3x-ui (v3 with CSRF) ───────────────────────────────────────
-HTML=$(curl -s --max-time 10 -c "$COOKIE" "${XUI_HOST}/")
-CSRF=$(grep -o 'csrf-token" content="[^"]*' <<< "$HTML" | sed 's/csrf-token" content="//')
+# ── Add client to SQLite directly ──────────────────────────────────────
+echo "[+] Writing client to SQLite..."
+python3 - "$INBOUND_ID" "$UUID" "$EMAIL" "$DB" << 'PYEOF'
+import sqlite3, json, sys
 
-login_ok=0
-for PASS in "${XUI_PASSWORD:-}" "admin"; do
-    [[ -z "$PASS" ]] && continue
-    R=$(curl -s --max-time 10 -c "$COOKIE" -b "$COOKIE" \
-        -X POST "${XUI_HOST}/login" \
-        -H "X-CSRF-Token: ${CSRF}" \
-        -H "Content-Type: application/json" \
-        -d "{\"username\":\"${XUI_USERNAME:-admin}\",\"password\":\"${PASS}\"}" 2>/dev/null)
-    echo "$R" | grep -q '"success":true' && { login_ok=1; break; }
-done
-[[ $login_ok -eq 0 ]] && { echo "ERROR: 3x-ui login failed"; exit 1; }
+iid, uuid, email, db_path = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 
-# ── Add VLESS client ────────────────────────────────────────────────────
-CLIENT_JSON=$(python3 -c "
-import json
-client = {
-    'id': '${UUID}',
-    'email': '${EMAIL}',
-    'limitIp': 1,
-    'totalGB': 0,
-    'expiryTime': 0,
-    'enable': True,
-    'tgId': '',
-    'subId': '',
-    'flow': 'xtls-rprx-vision'
-}
-payload = {'id': ${INBOUND_ID}, 'settings': json.dumps({'clients': [client]})}
-print(json.dumps(payload))
-")
+db = sqlite3.connect(db_path)
+try:
+    row = db.execute('SELECT settings FROM inbounds WHERE id=?', (iid,)).fetchone()
+    if not row:
+        print(f'ERROR: inbound {iid} not found')
+        sys.exit(1)
 
-ADD=$(curl -s --max-time 10 \
-    -b "$COOKIE" \
-    -X POST "${XUI_HOST}/xui/API/inbounds/addClient" \
-    -H "Content-Type: application/json" \
-    -H "X-CSRF-Token: ${CSRF}" \
-    -d "$CLIENT_JSON")
+    settings = json.loads(row[0])
+    clients  = settings.get('clients', [])
 
-if ! echo "$ADD" | grep -q '"success":true'; then
-    echo "WARN: 3x-ui addClient response: $ADD"
-fi
+    for c in clients:
+        if c.get('email') == email:
+            print(f'ERROR: email already exists in inbound')
+            sys.exit(1)
 
-# ── Register subscription token ──────────────────────────────────────
+    clients.append({
+        'id': uuid, 'email': email, 'limitIp': 1,
+        'totalGB': 0, 'expiryTime': 0, 'enable': True,
+        'tgId': '', 'subId': '', 'flow': 'xtls-rprx-vision', 'reset': 0
+    })
+    settings['clients'] = clients
+    db.execute('UPDATE inbounds SET settings=? WHERE id=?',
+               (json.dumps(settings), iid))
+    db.commit()
+    print(f'[+] Client {email} added (UUID={uuid})')
+except Exception as e:
+    print(f'ERROR: {e}')
+    sys.exit(1)
+finally:
+    db.close()
+PYEOF
+
+# ── Restart 3x-ui to pick up changes ────────────────────────────────
+echo "[+] Restarting 3x-ui..."
+docker restart 3xui > /dev/null 2>&1
+sleep 4
+
+# ── Register in subscription service ───────────────────────────────────
 SUB=$(curl -s --max-time 10 \
     -X POST "${SUB_HOST}/admin/users" \
     -H "Content-Type: application/json" \
     -H "X-Admin-Token: ${ADMIN_TOKEN}" \
-    -d "{\"email\":\"${EMAIL}\"}")
+    -d "{\"email\":\"${EMAIL}\",\"uuid\":\"${UUID}\"}")
 
-TOKEN=$(python3 -c "import sys,json; print(json.loads(sys.stdin.read())['token'])" <<< "$SUB" 2>/dev/null || true)
+TOKEN=$(python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('token') or d.get('sub_token',''))" <<< "$SUB" 2>/dev/null || true)
 [[ -z "$TOKEN" ]] && { echo "ERROR: subscription service response: $SUB"; exit 1; }
 
 echo ""
