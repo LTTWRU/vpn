@@ -7,65 +7,57 @@ source .env
 
 XUI="http://127.0.0.1:2053"
 COOKIE=$(mktemp)
-trap "rm -f $COOKIE" EXIT
+JSON=$(mktemp)
+trap "rm -f $COOKIE $JSON" EXIT
 
 echo ""
 echo "=== Creating VLESS Reality inbound ==="
-echo ""
 
 # Login
 LOGIN=$(curl -sf -c "$COOKIE" -X POST "$XUI/login" \
     -d "username=${XUI_USERNAME}&password=${XUI_PASSWORD}")
-echo "$LOGIN" | grep -q '"success":true' || { echo "ERROR: Login failed. Check .env"; exit 1; }
-echo "[+] Logged in to 3x-ui"
+echo "$LOGIN" | grep -q '"success":true' || { echo "ERROR: Login failed"; exit 1; }
+echo "[+] Logged in"
 
-# Generate X25519 keys
-KEYS=$(docker exec 3xui xray x25519 2>/dev/null)
-PRIV=$(echo "$KEYS" | grep 'Private' | awk '{print $3}')
-PUB=$(echo  "$KEYS" | grep 'Public'  | awk '{print $3}')
-echo "[+] X25519 keys generated"
-echo "    Private : $PRIV"
-echo "    Public  : $PUB"
+# Build full payload in one Python script
+python3 << 'PYEOF' > "$JSON"
+import json, subprocess, secrets, sys
 
-# Generate short ID (8 hex chars)
-SHORTID=$(openssl rand -hex 4)
-echo "[+] Short ID: $SHORTID"
+# Generate X25519 keys via xray
+r = subprocess.run(['docker', 'exec', '3xui', 'xray', 'x25519'],
+                   capture_output=True, text=True)
+priv = pub = ''
+for line in r.stdout.strip().splitlines():
+    if 'Private' in line: priv = line.split()[-1]
+    if 'Public'  in line: pub  = line.split()[-1]
 
-# Build inbound JSON
-SETTINGS='{"clients":[],"decryption":"none","fallbacks":[]}'
+if not priv or not pub:
+    print('ERROR: could not generate X25519 keys', file=sys.stderr)
+    sys.exit(1)
 
-STREAM=$(python3 -c "
-import json
-d = {
+shortid = secrets.token_hex(4)
+
+# Print keys to stderr so they appear in terminal
+print(f'    Private key : {priv}', file=sys.stderr)
+print(f'    Public key  : {pub}',  file=sys.stderr)
+print(f'    Short ID    : {shortid}', file=sys.stderr)
+
+stream = {
     'network': 'tcp',
     'security': 'reality',
     'realitySettings': {
-        'show': False,
-        'xver': 0,
+        'show': False, 'xver': 0,
         'dest': 'www.apple.com:443',
         'serverNames': ['www.apple.com'],
-        'privateKey': '$PRIV',
-        'minClient': '',
-        'maxTimeDiff': 0,
-        'shortIds': ['$SHORTID'],
+        'privateKey': priv,
+        'minClient': '', 'maxTimeDiff': 0,
+        'shortIds': [shortid],
         'fingerprint': 'chrome',
         'headers': {}
     },
-    'tcpSettings': {
-        'acceptProxyProtocol': False,
-        'header': {'type': 'none'}
-    }
+    'tcpSettings': {'acceptProxyProtocol': False, 'header': {'type': 'none'}}
 }
-print(json.dumps(d))
-")
 
-SNIFFING='{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
-
-# Create inbound
-RESP=$(curl -sf -b "$COOKIE" -X POST "$XUI/xui/API/inbounds/add" \
-    -H 'Content-Type: application/json' \
-    -d "$(python3 -c "
-import json
 payload = {
     'remark': 'VLESS-Reality',
     'enable': True,
@@ -73,37 +65,49 @@ payload = {
     'port': 443,
     'protocol': 'vless',
     'expiryTime': 0,
-    'settings': json.dumps({\"clients\":[],\"decryption\":\"none\",\"fallbacks\":[]}),
-    'streamSettings': json.dumps(${STREAM}),
-    'sniffing': json.dumps({\"enabled\":True,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":False,\"routeOnly\":False}),
+    'settings':       json.dumps({'clients': [], 'decryption': 'none', 'fallbacks': []}),
+    'streamSettings': json.dumps(stream),
+    'sniffing':       json.dumps({'enabled': True, 'destOverride': ['http','tls','quic','fakedns'],
+                                  'metadataOnly': False, 'routeOnly': False}),
     'tag': 'inbound-443'
 }
+
+# Write pub/shortid as env vars to a sidecar file
+with open('/tmp/reality_keys.env', 'w') as f:
+    f.write(f'REALITY_PUBLIC_KEY={pub}\nREALITY_SHORT_ID={shortid}\n')
+
 print(json.dumps(payload))
-")"
-)
+PYEOF
+
+echo "[+] JSON payload ready"
+
+# Create inbound
+RESP=$(curl -sf -b "$COOKIE" -X POST "$XUI/xui/API/inbounds/add" \
+    -H 'Content-Type: application/json' \
+    -d @"$JSON")
 
 if echo "$RESP" | grep -q '"success":true'; then
-    INBOUND_ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['obj']['id'])" 2>/dev/null || echo "1")
-    # Update INBOUND_ID in .env
+    INBOUND_ID=$(python3 -c "import sys,json; print(json.load(sys.stdin)['obj']['id'])" <<< "$RESP" 2>/dev/null || echo "1")
     sed -i "s/^INBOUND_ID=.*/INBOUND_ID=${INBOUND_ID}/" .env
+    # Append reality keys to .env if not already there
+    grep -q REALITY_PUBLIC_KEY .env 2>/dev/null || cat /tmp/reality_keys.env >> .env
     echo "[+] Inbound created (id=${INBOUND_ID})"
 else
-    echo "WARN: Response: $RESP"
-    echo "Inbound may already exist or there was an error."
+    echo "Response: $RESP"
+    echo "WARN: inbound may already exist, or check the panel manually."
 fi
 
-# Save public key for users
-echo "REALITY_PUBLIC_KEY=${PUB}" >> .env 2>/dev/null || true
-echo "REALITY_SHORT_ID=${SHORTID}" >> .env 2>/dev/null || true
-
+# Show summary
+source /tmp/reality_keys.env 2>/dev/null || true
 echo ""
-echo "============================================"
-echo "  VLESS Reality inbound ready"
+echo "================================================"
+echo "  VLESS Reality inbound"
 echo "  Port       : 443"
-echo "  SNI dest   : www.apple.com:443"
-echo "  Public key : ${PUB}"
-echo "  Short ID   : ${SHORTID}"
-echo "============================================"
+echo "  Dest       : www.apple.com:443"
+echo "  Public key : ${REALITY_PUBLIC_KEY:-see above}"
+echo "  Short ID   : ${REALITY_SHORT_ID:-see above}"
+echo "================================================"
 echo ""
-echo "Next: bash /opt/vpn/scripts/add-user.sh user@example.com"
+echo "Add first user:"
+echo "  bash /opt/vpn/scripts/add-user.sh user@email.com"
 echo ""
